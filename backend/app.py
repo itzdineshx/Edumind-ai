@@ -1,4 +1,3 @@
-import re
 import os
 import json
 import tempfile
@@ -9,7 +8,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 
 load_dotenv()
-from rag import process_pdf, search_pdf
+from rag import process_pdf, get_context
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     TranscriptsDisabled,
@@ -17,30 +16,21 @@ from youtube_transcript_api._errors import (
     VideoUnavailable,
 )
 
-# Make bundled ffmpeg available to Whisper before importing it
-import imageio_ffmpeg
-import shutil
-
-_ffmpeg_src = imageio_ffmpeg.get_ffmpeg_exe()
-_ffmpeg_dir = os.path.dirname(_ffmpeg_src)
-_ffmpeg_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-_ffmpeg_dst = os.path.join(_ffmpeg_dir, _ffmpeg_name)
-if not os.path.exists(_ffmpeg_dst):
-    shutil.copy2(_ffmpeg_src, _ffmpeg_dst)
-    if os.name != "nt":
-        os.chmod(_ffmpeg_dst, 0o755)
-os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-
-import whisper
-
 app = Flask(__name__)
 _cors_origins = os.getenv("CORS_ORIGINS", "*").split(",")
 CORS(app, origins=_cors_origins)
 
-# Load Whisper model once at startup (use "base" for speed)
-whisper_model = whisper.load_model("base")
+# Whisper loaded lazily on first /transcribe request (avoids RAM spike at startup)
+_whisper_model = None
 
-db = None
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    return _whisper_model
+
+pdf_text = None
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -104,6 +94,27 @@ def call_gemini_json(system_prompt: str, user_prompt: str) -> dict:
     return json.loads(content)
 
 
+def call_gemini_text(system_prompt: str, user_prompt: str) -> str:
+    """Call OpenRouter (Gemini) and return plain text."""
+    res = requests.post(
+        OPENROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        },
+        timeout=120,
+    )
+    res.raise_for_status()
+    return res.json()["choices"][0]["message"]["content"]
+
+
 # ─── Routes ─────────────────────────────────────────────────
 
 @app.route("/")
@@ -113,24 +124,41 @@ def home():
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    file = request.files["file"]
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "No file provided."}), 400
     fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
     try:
         os.close(fd)
         file.save(tmp_path)
-        global db
-        db = process_pdf(tmp_path)
+        global pdf_text
+        pdf_text = process_pdf(tmp_path)
+        return jsonify({"message": "PDF processed successfully"})
+    except Exception as e:
+        return jsonify({"error": f"PDF processing failed: {str(e)}"}), 500
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-    return jsonify({"message": "PDF processed successfully"})
 
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    question = request.json["question"]
-    answer = search_pdf(db, question)
-    return jsonify({"answer": answer})
+    if pdf_text is None:
+        return jsonify({"error": "No PDF uploaded yet."}), 400
+    question = (request.json or {}).get("question", "").strip()
+    if not question:
+        return jsonify({"error": "Question is required."}), 400
+    context = get_context(pdf_text, question)
+    try:
+        answer = call_gemini_text(
+            "You are an AI study assistant. Answer the student's question based only on "
+            "the provided document content. Be clear and concise. Use markdown (bullet points, "
+            "bold) where helpful. If the answer is not in the document, say so.",
+            f'Document content:\n"""\n{context}\n"""\n\nQuestion: {question}',
+        )
+        return jsonify({"answer": answer})
+    except Exception as e:
+        return jsonify({"error": f"AI answer failed: {str(e)}"}), 500
 
 
 @app.route("/generate-quiz", methods=["POST"])
@@ -194,7 +222,7 @@ def generate_quiz():
 
 @app.route("/transcribe", methods=["POST"])
 def transcribe():
-    """Accept an audio file and return its transcript using Whisper."""
+    """Accept an audio file and return its transcript using faster-whisper."""
     if "file" not in request.files:
         return jsonify({"error": "No audio file provided."}), 400
 
@@ -202,14 +230,14 @@ def transcribe():
     if not audio_file.filename:
         return jsonify({"error": "Empty filename."}), 400
 
-    # Save to a temp file so Whisper can read it
     suffix = os.path.splitext(audio_file.filename)[1] or ".wav"
     fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     try:
         os.close(fd)
         audio_file.save(tmp_path)
-        result = whisper_model.transcribe(tmp_path)
-        transcript_text = result.get("text", "").strip()
+        model = get_whisper_model()
+        segments, _ = model.transcribe(tmp_path, beam_size=1)
+        transcript_text = " ".join(seg.text for seg in segments).strip()
         if not transcript_text:
             return jsonify({"error": "Could not extract any speech from the audio."}), 422
         return jsonify({"transcript": transcript_text})
