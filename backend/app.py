@@ -17,8 +17,7 @@ from youtube_transcript_api._errors import (
 )
 
 app = Flask(__name__)
-_cors_origins = os.getenv("CORS_ORIGINS", "*").split(",")
-CORS(app, origins=_cors_origins)
+CORS(app)
 
 # Whisper loaded lazily on first /transcribe request (avoids RAM spike at startup)
 _whisper_model = None
