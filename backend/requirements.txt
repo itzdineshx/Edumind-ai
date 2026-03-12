@@ -1,15 +1,8 @@
 flask
 flask-cors
 gunicorn
-sentence-transformers
-langchain
-langchain-community
-langchain-huggingface
-faiss-cpu
 pypdf
 python-dotenv
-numpy
-openai-whisper
-imageio-ffmpeg
 requests
+faster-whisper
 youtube-transcript-api
